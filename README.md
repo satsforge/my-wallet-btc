@@ -1,4 +1,6 @@
-# Mi Wallet BTC
+# My Wallet BTC
+
+Repo: [github.com/satsforge/my-wallet-btc](https://github.com/satsforge/my-wallet-btc)
 
 Wallet de Bitcoin 100% del lado del cliente. A diferencia de un generador de
 carteras de papel, esta herramienta **importa** una wallet existente (frase
@@ -27,7 +29,7 @@ Abrí `index.html` en un navegador moderno (Chrome, Firefox, Edge). Podés
 abrirlo directamente como `file://` o servirlo con cualquier servidor
 estático — no requiere backend propio.
 
-## Modo Básico / Avanzado, idioma y tema
+### Modo Básico / Avanzado, idioma y tema
 
 La barra superior — igual en espíritu a la de paper-wallet-btc — tiene tres
 interruptores, ninguno persiste entre recargas (ni `localStorage` ni cookies,
@@ -44,8 +46,6 @@ mismo criterio "cero persistencia" que su app hermana):
   el dashboard/revisión de envío si ya hay una wallet desbloqueada.
 - **☀/🌙 Tema**: claro/oscuro, variables CSS bajo `[data-theme='light']`
   (misma paleta que paper-wallet-btc, en vez de una paleta propia).
-
-## Cómo usarlo
 
 1. Elegí la red (Testnet por defecto; Mainnet exige tildar un checkbox de
    confirmación explícita).
@@ -133,7 +133,7 @@ mismo criterio "cero persistencia" que su app hermana):
 
 ## Diferencias con `paper-wallet-btc`
 
-| | paper-wallet-btc | Mi Wallet BTC |
+| | paper-wallet-btc | My Wallet BTC |
 |---|---|---|
 | Propósito | Generar una wallet nueva | Acceder a una wallet existente |
 | Red | Ninguna (air-gapped) | Sí (consulta saldo y transmite) |
@@ -142,7 +142,7 @@ mismo criterio "cero persistencia" que su app hermana):
 | Direcciones | Legacy/SegWit/Taproot, un índice cada una | Las mismas 4, + cuenta HD completa en BIP84 |
 
 Cualquier wallet generada con paper-wallet-btc se puede abrir directamente
-en Mi Wallet BTC: la frase semilla (cifrada o no), el WIF impreso, y la
+en My Wallet BTC: la frase semilla (cifrada o no), el WIF impreso, y la
 clave BIP38 cifrada son todos formatos que esta wallet entiende de forma
 nativa — se probó de punta a punta contra la salida real de
 paper-wallet-btc (ver `test/bip38.test.mjs`, `test/seedcipher.test.mjs` y

@@ -7,8 +7,10 @@ export const LANGS = ['es', 'en'];
 export const DEFAULT_LANG = 'es';
 
 const dict = {
-  'meta.title': { es: 'Mi Wallet BTC', en: 'My BTC Wallet' },
-  'topbar.brand': { es: 'Mi Wallet BTC', en: 'My BTC Wallet' },
+  // Product name - kept as one fixed English name across languages
+  // (like "Bitcoin" itself isn't translated), not a mixed-language string.
+  'meta.title': { es: 'My Wallet BTC', en: 'My Wallet BTC' },
+  'topbar.brand': { es: 'My Wallet BTC', en: 'My Wallet BTC' },
   'topbar.mode.tip': {
     es: 'Básico: solo frase semilla + passphrase, lo esencial para acceder. Avanzado: agrega semilla cifrada (AES), clave privada (WIF/BIP38) y carga desde archivo.',
     en: 'Basic: just seed phrase + passphrase, the essentials to unlock. Advanced: adds encrypted seed (AES), private key (WIF/BIP38), and loading from a file.',

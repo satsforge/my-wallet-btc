@@ -1,5 +1,5 @@
 {
-  "name": "my-btc-wallet",
+  "name": "my-wallet-btc",
   "version": "1.0.0",
   "description": "Wallet Bitcoin cliente-side: acceso via seed phrase + passphrase BIP39, envio de fondos via mempool.space",
   "main": "index.js",
