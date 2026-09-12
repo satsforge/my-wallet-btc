@@ -24,6 +24,15 @@ export function addressForType(publicKey, type, network) {
   throw new Error(`Tipo de direccion desconocido: ${type}`);
 }
 
+/** The locking script the address of that type actually pays to. */
+export function scriptForType(publicKey, type, network) {
+  if (type === 'legacy') return btc.p2pkh(publicKey, network).script;
+  if (type === 'p2sh') return btc.p2sh(btc.p2wpkh(publicKey, network), network).script;
+  if (type === 'bech32') return btc.p2wpkh(publicKey, network).script;
+  if (type === 'taproot') return btc.p2tr(publicKey.slice(1, 33), undefined, network).script;
+  throw new Error(`Tipo de direccion desconocido: ${type}`);
+}
+
 /**
  * Derives the paper-wallet-btc-compatible fixed address for one type
  * directly from the master seed (independent of my-wallet-btc's own BIP84
@@ -55,4 +64,31 @@ export function annotateUtxoForType(utxo, node, type, network) {
     return { ...utxo, witnessUtxo: prevout, tapInternalKey: node.publicKey.slice(1, 33) };
   }
   return utxo;
+}
+
+/**
+ * Adds the BIP32 key-origin metadata (BIP174's bip32Derivation, or
+ * tapBip32Derivation for Taproot) that tells whoever signs this PSBT later
+ * *which* key to derive and from which master.
+ *
+ * Without it a signer has to guess. PSBT Signer BTC, for instance, falls
+ * back to brute-forcing its own conventions - which only ever computes
+ * Native SegWit scripts for an account's chains, so a legacy/P2SH/Taproot
+ * watch-only wallet's PSBT would be unsignable there with nothing on screen
+ * to say why until the user is already at the offline machine.
+ *
+ * `origin` is { fingerprint (number), accountPath (number[]) }; `chain` and
+ * `index` are the last two path elements. Returns the utxo untouched when
+ * any of that is missing (an imported single key has no derivation path at
+ * all, so there is nothing truthful to declare).
+ */
+export function annotateUtxoOrigin(utxo, node, type, origin, chain, index) {
+  if (!origin || chain === null || chain === undefined || index === null || index === undefined) return utxo;
+  const path = [...origin.accountPath, chain, index];
+  const der = { fingerprint: origin.fingerprint, path };
+  if (type === 'taproot') {
+    // Key-path-only spend: no script tree, so no leaf hashes to declare.
+    return { ...utxo, tapBip32Derivation: [[node.publicKey.slice(1, 33), { hashes: [], der }]] };
+  }
+  return { ...utxo, bip32Derivation: [[node.publicKey, der]] };
 }
