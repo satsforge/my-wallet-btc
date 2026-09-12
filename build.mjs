@@ -29,10 +29,14 @@ async function main() {
   const cssCode = cssResult.code.trim();
 
   const scriptHash = sha256b64(scriptCode);
+  const styleHash = sha256b64(cssCode);
   const csp = [
     "default-src 'none'",
     `script-src 'sha256-${scriptHash}'`,
-    "style-src 'unsafe-inline'",
+    // A hash rather than 'unsafe-inline': nothing here sets a style
+    // attribute or injects a <style> at runtime, so there is no reason to
+    // allow arbitrary inline styles - only this exact stylesheet.
+    `style-src 'sha256-${styleHash}'`,
     "img-src 'self' data:",
     "font-src 'self'",
     // This wallet, unlike a pure paper-wallet generator, needs the network to
@@ -55,6 +59,7 @@ async function main() {
 
   console.log(`Built index.html (${(html.length / 1024).toFixed(1)} KiB)`);
   console.log(`script-src hash: sha256-${scriptHash}`);
+  console.log(`style-src hash: sha256-${styleHash}`);
 }
 
 main().catch((err) => {

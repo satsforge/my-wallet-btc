@@ -1,31 +1,47 @@
 import * as btc from '@scure/btc-signer';
+import { base64 } from '@scure/base';
 import QRCode from 'qrcode';
 import { isValidMnemonic, seedFromMnemonic } from './lib/mnemonic.js';
 import { accountFromSeed, btcNetwork, keyNodeFromPrivateKey, RECEIVE_CHAIN } from './lib/hdwallet.js';
 import { createProvider } from './lib/network.js';
-import { scanWallet, scanImportedKey, collectUtxoPool } from './lib/scan.js';
+import { scanWallet, scanImportedKey, scanWatchOnly, collectUtxoPool } from './lib/scan.js';
 import { buildSendTx, signTx } from './lib/txbuilder.js';
 import { decryptMnemonic } from './lib/seedcipher.js';
 import { decryptBip38, isBip38 } from './lib/bip38.js';
+import { parseExtendedPubkey, parseKeyOrigin, validateXpubDepth, defaultAccountPath } from './lib/watchonly.js';
 import { t, DEFAULT_LANG } from './lib/i18n.js';
 
 const $ = (id) => document.getElementById(id);
 const SCREENS = ['unlock', 'scanning', 'dashboard', 'send', 'review', 'result'];
+
+// Above this share of what's being spent, a fee reads as a typo rather than
+// a choice - even a badly congested mempool rarely justifies double digits.
+const FEE_WARNING_RATIO = 0.10;
+
+// This wallet holds a decrypted seed and every key derived from it for as
+// long as it stays unlocked, and it is the one tool in the suite that also
+// has network access. If it's left open and unattended, whoever reaches the
+// keyboard inherits all of that - so lock it back up on its own.
+const INACTIVITY_LOCK_MS = 10 * 60 * 1000;
 
 const state = {
   isTestnet: true,
   network: null,
   provider: null,
   lang: DEFAULT_LANG,
-  mode: null, // 'seed' | 'key' - how the current session was unlocked
+  mode: null, // 'seed' | 'key' | 'watch' - how the current session was unlocked
   account: null, // HDKey account (seed mode)
   seed: null, // kept in memory for the session so "Actualizar" can re-check the paper-wallet-btc fixed addresses too
   importedNode: null, // key node (key mode)
   importedCompressed: true,
+  watchAccount: null, // public-only HDKey account (watch mode)
+  watchAddressType: 'bech32',
+  keyOrigin: null, // { fingerprint, accountPath } - what a PSBT needs to declare where its keys come from (watch mode)
   scan: null, // unified: { funded, totalBalance, firstUnusedReceive, firstUnusedChange }
   utxoPool: null, // { utxos, signerByOutpoint }
   feeRates: null, // { fast, medium, slow }
   pendingSend: null, // { selected, destinationAddress, sendMax, feePerByte }
+  lastResult: null, // { txid, output, kind } - for re-rendering screen-result on language change
 };
 
 function tr(key, vars) {
@@ -58,11 +74,15 @@ function updateNetworkBadge() {
 }
 
 function addressLabel(addr) {
+  const label = tr(`addressType.${addr.type}`);
   if (addr.source === 'hd') {
     const chain = tr(addr.chain === RECEIVE_CHAIN ? 'scan.hdReceive' : 'scan.hdChange');
-    return tr('addressLabel.hd', { chain, index: addr.index });
+    return tr('addressLabel.hd', { type: label, chain, index: addr.index });
   }
-  const label = tr(`addressType.${addr.type}`);
+  if (addr.source === 'watch') {
+    const chain = tr(addr.chain === RECEIVE_CHAIN ? 'scan.hdReceive' : 'scan.hdChange');
+    return tr('addressLabel.watch', { label, chain, index: addr.index });
+  }
   if (addr.source === 'paper') return tr('addressLabel.paper', { label });
   if (addr.source === 'imported') return tr('addressLabel.imported', { label });
   return label;
@@ -71,7 +91,7 @@ function addressLabel(addr) {
 function describeScanProgress(record) {
   const used = record.used ? tr('scan.used') : '';
   const addr = fmtAddress(record.address);
-  if (record.source === 'hd') {
+  if (record.source === 'hd' || record.source === 'watch') {
     const chain = tr(record.chain === RECEIVE_CHAIN ? 'scan.hdReceive' : 'scan.hdChange');
     return tr('scan.progressHd', { chain, index: record.index, addr, used });
   }
@@ -116,6 +136,7 @@ function applyTranslations() {
   if (state.feeRates) refreshFeeLabels();
   if (state.scan) renderDashboard();
   if (state.pendingSend) renderReview();
+  if (state.lastResult) renderResult(state.lastResult);
 }
 
 function initTopbar() {
@@ -140,9 +161,11 @@ function initTopbar() {
       // acts on a hidden/stale WIF or encrypted-seed entry.
       $('mode-seed').checked = true;
       $('mode-key').checked = false;
+      $('mode-watch').checked = false;
       $('seed-encrypted-checkbox').checked = false;
       $('seed-fields').hidden = false;
       $('key-fields').hidden = true;
+      $('watch-fields').hidden = true;
       $('mnemonic-field').hidden = false;
       $('encrypted-seed-fields').hidden = true;
     }
@@ -175,13 +198,28 @@ function initUnlockScreen() {
 
   const modeSeedRadio = $('mode-seed');
   const modeKeyRadio = $('mode-key');
+  const modeWatchRadio = $('mode-watch');
   function syncModeUI() {
     $('seed-fields').hidden = !modeSeedRadio.checked;
     $('key-fields').hidden = !modeKeyRadio.checked;
+    $('watch-fields').hidden = !modeWatchRadio.checked;
   }
   modeSeedRadio.addEventListener('change', syncModeUI);
   modeKeyRadio.addEventListener('change', syncModeUI);
+  modeWatchRadio.addEventListener('change', syncModeUI);
   syncModeUI();
+
+  // The conventional account path is fully determined by the address type
+  // and the network (BIP44/49/84/86 + SLIP-44 coin type), so offer it as a
+  // placeholder rather than making the user look it up - while still
+  // letting anyone whose wallet uses a different account index type it in.
+  function syncAccountPathPlaceholder() {
+    $('watch-account-path').placeholder = defaultAccountPath($('watch-address-type').value, testnetRadio.checked);
+  }
+  $('watch-address-type').addEventListener('change', syncAccountPathPlaceholder);
+  mainnetRadio.addEventListener('change', syncAccountPathPlaceholder);
+  testnetRadio.addEventListener('change', syncAccountPathPlaceholder);
+  syncAccountPathPlaceholder();
 
   const seedEncryptedCheckbox = $('seed-encrypted-checkbox');
   function syncSeedEncryptedUI() {
@@ -221,6 +259,7 @@ function initUnlockScreen() {
   wireFileLoad('mnemonic-file-btn', 'mnemonic-file-input', 'mnemonic-input');
   wireFileLoad('encrypted-seed-file-btn', 'encrypted-seed-file-input', 'encrypted-seed-input');
   wireFileLoad('wif-file-btn', 'wif-file-input', 'wif-input');
+  wireFileLoad('xpub-file-btn', 'xpub-file-input', 'xpub-input');
 
   function clearUnlockInputs() {
     $('mnemonic-input').value = '';
@@ -229,16 +268,41 @@ function initUnlockScreen() {
     $('passphrase-input').value = '';
     $('wif-input').value = '';
     $('wif-passphrase-input').value = '';
+    $('xpub-input').value = '';
+    $('watch-fingerprint').value = '';
+    $('watch-account-path').value = '';
   }
 
   $('unlock-form').addEventListener('submit', async (ev) => {
     ev.preventDefault();
     setError('unlock-error', null);
+    $('autolock-notice').hidden = true;
     state.isTestnet = testnetRadio.checked;
     updateNetworkBadge();
     unlockBtn.disabled = true;
     try {
-      if (modeKeyRadio.checked) {
+      if (modeWatchRadio.checked) {
+        state.mode = 'watch';
+        state.network = btcNetwork(state.isTestnet);
+        state.provider = createProvider(state.isTestnet);
+        const xpubRaw = $('xpub-input').value;
+        let watchAccount;
+        try {
+          watchAccount = parseExtendedPubkey(xpubRaw, state.isTestnet);
+        } catch (err) {
+          throw new Error(tr('error.badXpub', { msg: err.message }));
+        }
+        state.watchAccount = watchAccount;
+        state.watchAddressType = $('watch-address-type').value;
+        try {
+          state.keyOrigin = parseKeyOrigin($('watch-fingerprint').value, $('watch-account-path').value);
+          validateXpubDepth(watchAccount, state.keyOrigin?.accountPath);
+        } catch (err) {
+          throw new Error(tr('error.badKeyOrigin', { msg: err.message }));
+        }
+        clearUnlockInputs();
+        await runScanWatch();
+      } else if (modeKeyRadio.checked) {
         state.mode = 'key';
         state.network = btcNetwork(state.isTestnet);
         state.provider = createProvider(state.isTestnet);
@@ -296,7 +360,7 @@ function initUnlockScreen() {
 
 async function afterScan() {
   state.utxoPool = state.scan.funded.length
-    ? await collectUtxoPool(state.scan.funded, state.provider, state.isTestnet)
+    ? await collectUtxoPool(state.scan.funded, state.provider, state.isTestnet, state.keyOrigin)
     : { utxos: [], signerByOutpoint: new Map() };
   let fast, medium, slow;
   try {
@@ -305,6 +369,7 @@ async function afterScan() {
     fast = medium = slow = 5n;
   }
   state.feeRates = { fast, medium, slow };
+  resetInactivityTimer();
   renderDashboard();
   showScreen('dashboard');
 }
@@ -353,8 +418,27 @@ async function runScanKey() {
   }
 }
 
+async function runScanWatch() {
+  showScreen('scanning');
+  const log = $('scan-log');
+  log.textContent = '';
+  try {
+    const scan = await scanWatchOnly(state.watchAccount, state.watchAddressType, state.isTestnet, state.provider, (record) => {
+      log.textContent = describeScanProgress(record);
+    });
+    state.scan = scan;
+    await afterScan();
+  } catch (err) {
+    setError('unlock-error', tr('error.networkFailed', { msg: err.message }));
+    showScreen('unlock');
+    $('unlock-btn').disabled = false;
+  }
+}
+
 function rescan() {
-  return state.mode === 'key' ? runScanKey() : runScanSeed();
+  if (state.mode === 'key') return runScanKey();
+  if (state.mode === 'watch') return runScanWatch();
+  return runScanSeed();
 }
 
 // ---------- Dashboard ----------
@@ -362,6 +446,7 @@ function rescan() {
 function renderDashboard() {
   $('total-balance').textContent = `${fmtBtc(state.scan.totalBalance)} BTC`;
   $('imported-key-notice').hidden = state.mode !== 'key';
+  $('watch-notice').hidden = state.mode !== 'watch';
   const list = $('address-list');
   list.innerHTML = '';
   if (state.scan.funded.length === 0) {
@@ -413,20 +498,84 @@ function initDashboardScreen() {
   });
 }
 
-function lockWallet() {
+// node.privateKey (HDKey) and keyNodeFromPrivateKey's .privateKey are both
+// copy-on-read getters - zeroing what they return doesn't touch the private
+// key actually held by the node itself. Every node that can carry one needs
+// its own wipe call: state.account plus every per-address node reachable
+// from a scan (each is an independent derivation, not a live view into
+// state.account) and every node captured in utxoPool's signer index.
+function wipeNode(node) {
+  if (!node) return;
+  if (typeof node.wipePrivateData === 'function') node.wipePrivateData();
+  else if (typeof node.wipe === 'function') node.wipe();
+}
+
+function wipeScanNodes(scan) {
+  if (!scan) return;
+  for (const addr of [...(scan.receive ?? []), ...(scan.change ?? []), ...(scan.paper ?? [])]) {
+    wipeNode(addr.node);
+  }
+}
+
+// ---------- Auto-lock ----------
+
+let inactivityTimer = null;
+let lastActivityAt = 0;
+
+function clearInactivityTimer() {
+  if (inactivityTimer) { clearTimeout(inactivityTimer); inactivityTimer = null; }
+}
+
+/** Re-arms the countdown, but only while something is actually unlocked -
+ * before that there is nothing in memory worth locking. */
+function resetInactivityTimer() {
+  clearInactivityTimer();
+  if (state.mode) {
+    inactivityTimer = setTimeout(() => lockWallet({ reason: 'inactivity' }), INACTIVITY_LOCK_MS);
+  }
+}
+
+function initAutoLock() {
+  const events = ['mousedown', 'mousemove', 'keydown', 'touchstart', 'scroll', 'wheel'];
+  events.forEach((evt) => {
+    window.addEventListener(evt, () => {
+      // mousemove and scroll fire constantly; only the timer's own duration
+      // matters here, so don't churn a timeout on every single event.
+      const now = Date.now();
+      if (now - lastActivityAt < 1000) return;
+      lastActivityAt = now;
+      resetInactivityTimer();
+    }, { passive: true });
+  });
+}
+
+function lockWallet(opts) {
+  // Also wired straight to the "Bloquear" button, so `opts` may be a
+  // MouseEvent - only the inactivity timer passes this exact shape.
+  const dueToInactivity = Boolean(opts && opts.reason === 'inactivity');
+  clearInactivityTimer();
   if (state.seed) state.seed.fill(0);
   if (state.importedNode) state.importedNode.wipe();
+  wipeNode(state.account);
+  wipeScanNodes(state.scan);
+  if (state.utxoPool) {
+    for (const node of state.utxoPool.signerByOutpoint.values()) wipeNode(node);
+  }
   state.mode = null;
   state.account = null;
   state.seed = null;
   state.importedNode = null;
+  state.watchAccount = null;
+  state.keyOrigin = null;
   state.scan = null;
   state.utxoPool = null;
   state.feeRates = null;
   state.pendingSend = null;
+  state.lastResult = null;
   state.provider = null;
   state.network = null;
   $('unlock-btn').disabled = false;
+  $('autolock-notice').hidden = !dueToInactivity;
   showScreen('unlock');
 }
 
@@ -485,11 +634,28 @@ function initSendScreen() {
     let feePerByte = feeChoiceEl ? satsForFeeChoice(feeChoiceEl.value) : state.feeRates.medium;
     const customFee = $('fee-custom-input').value.trim();
     if (feeChoiceEl?.value === 'custom') {
-      if (!customFee || Number(customFee) <= 0) {
+      const customFeeNum = Number(customFee);
+      // Number('1,5') (a decimal comma, the standard separator in es-AR/es-ES)
+      // is NaN, and NaN <= 0 is false - the old check let it through and
+      // BigInt(NaN) threw uncaught, silently swallowing the "continuar" click.
+      if (!customFee || !Number.isFinite(customFeeNum) || customFeeNum <= 0) {
         setError('send-error', tr('error.badCustomFee'));
         return;
       }
-      feePerByte = BigInt(Math.round(Number(customFee)));
+      feePerByte = BigInt(Math.round(customFeeNum));
+    }
+
+    // selectUTXO would reject a wrong-network destination too, but only
+    // from deep inside the address decoder - the user gets something like
+    // 'Unknown letter "0"' instead of being told they pasted a mainnet
+    // address into a testnet session. Check it here, where we know why.
+    try {
+      btc.Address(state.network).decode(destinationAddress);
+    } catch {
+      setError('send-error', tr('error.wrongNetworkAddress', {
+        network: tr(state.isTestnet ? 'network.badge.testnet' : 'network.badge.mainnet'),
+      }));
+      return;
     }
 
     let selected;
@@ -526,49 +692,159 @@ function renderReview() {
   $('review-destination').textContent = destinationAddress;
   $('review-amount').textContent = `${fmtBtc(sentOutput ? sentOutput.amount : 0n)} BTC`;
   $('review-fee').textContent = `${fmtBtc(selected.fee)} BTC`;
+  // Shown in full, like the destination above it: this is the review screen,
+  // and an address worth checking is worth showing whole.
   $('review-change').textContent = changeOutput
-    ? tr('review.changeDetail', { amount: fmtBtc(changeOutput.amount), addr: fmtAddress(state.scan.firstUnusedChange.address) })
+    ? tr('review.changeDetail', { amount: fmtBtc(changeOutput.amount), addr: state.scan.firstUnusedChange.address })
     : tr('review.noChange');
+
+  const isWatch = state.mode === 'watch';
+  $('confirm-send-btn').hidden = isWatch;
+  $('sign-only-btn').hidden = isWatch;
+  $('build-psbt-btn').hidden = !isWatch;
+  $('review-confirm-label').textContent = tr(isWatch ? 'review.confirmWatch' : 'review.confirm');
+
+  // A fee that eats a large share of what's being spent is almost always a
+  // mistyped custom rate rather than a deliberate choice. The number was
+  // always on screen; this makes an anomalous one impossible to skim past.
+  const inputsTotal = selected.outputs.reduce((sum, o) => sum + o.amount, 0n) + selected.fee;
+  const feeRatio = inputsTotal > 0n ? Number(selected.fee) / Number(inputsTotal) : 0;
+  $('review-fee-warning').hidden = feeRatio <= FEE_WARNING_RATIO;
+
+  // Without a declared key origin, a PSBT exported from watch-only mode can
+  // only be signed by a tool that happens to guess the same derivation
+  // convention - which for anything but Native SegWit means it can't be
+  // signed at all. Say so here, while there's still something to do about
+  // it, instead of letting the user find out at the offline machine.
+  $('review-psbt-warning').hidden = !(isWatch && !state.keyOrigin);
+
   $('review-confirm-checkbox').checked = false;
   $('confirm-send-btn').disabled = true;
+  $('sign-only-btn').disabled = true;
+  $('build-psbt-btn').disabled = true;
   setError('review-error', null);
 }
 
 function initReviewScreen() {
   $('review-confirm-checkbox').addEventListener('change', (ev) => {
     $('confirm-send-btn').disabled = !ev.target.checked;
+    $('sign-only-btn').disabled = !ev.target.checked;
+    $('build-psbt-btn').disabled = !ev.target.checked;
   });
   $('cancel-review-btn').addEventListener('click', () => { showScreen('send'); });
+
   $('confirm-send-btn').addEventListener('click', async () => {
     setError('review-error', null);
     $('confirm-send-btn').disabled = true;
+    $('sign-only-btn').disabled = true;
     try {
       const { selected } = state.pendingSend;
       signTx(selected.tx, state.utxoPool.signerByOutpoint);
       const txid = await state.provider.sendTx(selected.tx.hex);
-      renderResult(txid, selected.tx.hex);
+      await renderResult({ txid, output: selected.tx.hex, kind: 'broadcast' });
       showScreen('result');
     } catch (err) {
       setError('review-error', tr('error.signFailed', { msg: err.message }));
       $('confirm-send-btn').disabled = false;
+      $('sign-only-btn').disabled = false;
+    }
+  });
+
+  $('sign-only-btn').addEventListener('click', async () => {
+    setError('review-error', null);
+    $('confirm-send-btn').disabled = true;
+    $('sign-only-btn').disabled = true;
+    try {
+      const { selected } = state.pendingSend;
+      signTx(selected.tx, state.utxoPool.signerByOutpoint);
+      await renderResult({ txid: selected.tx.id, output: selected.tx.hex, kind: 'signedOnly' });
+      showScreen('result');
+    } catch (err) {
+      setError('review-error', tr('error.signOnlyFailed', { msg: err.message }));
+      $('confirm-send-btn').disabled = false;
+      $('sign-only-btn').disabled = false;
+    }
+  });
+
+  $('build-psbt-btn').addEventListener('click', async () => {
+    setError('review-error', null);
+    $('build-psbt-btn').disabled = true;
+    try {
+      const { selected } = state.pendingSend;
+      const psbt = base64.encode(selected.tx.toPSBT());
+      await renderResult({ txid: null, output: psbt, kind: 'unsignedPsbt' });
+      showScreen('result');
+    } catch (err) {
+      setError('review-error', tr('error.buildPsbtFailed', { msg: err.message }));
+      $('build-psbt-btn').disabled = false;
     }
   });
 }
 
 // ---------- Result ----------
 
-function renderResult(txid, txHex) {
-  $('result-txid').textContent = txid;
-  $('result-hex').textContent = txHex;
-  const explorerBase = state.isTestnet ? 'https://mempool.space/testnet/tx/' : 'https://mempool.space/tx/';
-  const link = $('result-explorer-link');
-  link.href = `${explorerBase}${txid}`;
-  link.textContent = link.href;
+function downloadText(filename, text) {
+  const blob = new Blob([text], { type: 'text/plain' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+const RESULT_TITLE_KEY = { broadcast: 'result.title.broadcast', signedOnly: 'result.title.signedOnly', unsignedPsbt: 'result.title.unsignedPsbt' };
+const RESULT_HINT_KEY = { broadcast: 'result.hint.broadcast', signedOnly: 'result.hint.signedOnly', unsignedPsbt: 'result.hint.unsignedPsbt' };
+const RESULT_LABEL_KEY = { broadcast: 'result.hexLabel', signedOnly: 'result.hexLabel', unsignedPsbt: 'result.psbtLabel' };
+
+async function renderResult({ txid, output, kind }) {
+  state.lastResult = { txid, output, kind };
+  $('result-title').textContent = tr(RESULT_TITLE_KEY[kind]);
+  $('result-hint').textContent = tr(RESULT_HINT_KEY[kind]);
+  $('result-output-label').textContent = tr(RESULT_LABEL_KEY[kind]);
+  $('result-hex').value = output;
+
+  const hasTxid = kind !== 'unsignedPsbt';
+  $('result-txid-row').hidden = !hasTxid;
+  if (hasTxid) $('result-txid').textContent = txid;
+
+  const broadcasted = kind === 'broadcast';
+  const explorerRow = $('result-explorer-row');
+  explorerRow.hidden = !broadcasted;
+  if (broadcasted) {
+    const explorerBase = state.isTestnet ? 'https://mempool.space/testnet/tx/' : 'https://mempool.space/tx/';
+    const link = $('result-explorer-link');
+    link.href = `${explorerBase}${txid}`;
+    link.textContent = link.href;
+  }
+
+  const qr = $('result-qr');
+  try {
+    const dataUrl = await QRCode.toDataURL(output, { margin: 1, width: 240 });
+    qr.src = dataUrl;
+    qr.hidden = false;
+  } catch {
+    qr.hidden = true; // payload too large for a single QR - text + download still work
+  }
 }
 
 function initResultScreen() {
+  $('result-copy-btn').addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText($('result-hex').value);
+      const btnEl = $('result-copy-btn');
+      btnEl.textContent = tr('result.copied');
+      setTimeout(() => { btnEl.textContent = tr('result.copy'); }, 1500);
+    } catch { /* clipboard may be unavailable; text is selectable regardless */ }
+  });
+  $('result-download-btn').addEventListener('click', () => {
+    downloadText('my-wallet-btc-tx.txt', $('result-hex').value);
+  });
   $('back-to-dashboard-btn').addEventListener('click', async () => {
     state.pendingSend = null;
+    state.lastResult = null;
     await rescan();
   });
 }
@@ -582,6 +858,7 @@ function init() {
   initSendScreen();
   initReviewScreen();
   initResultScreen();
+  initAutoLock();
   applyTranslations();
   showScreen('unlock');
 }

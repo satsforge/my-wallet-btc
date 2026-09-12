@@ -30,6 +30,7 @@
 
 <section id="screen-unlock" class="screen">
   <div class="panel">
+  <p id="autolock-notice" class="notice notice-info" hidden data-i18n="notice.autoLocked"></p>
   <div class="notice notice-warning" data-i18n="notice.warning">
     <strong>Aviso:</strong> esta wallet firma y transmite transacciones reales de Bitcoin.
     Probala primero en <strong>testnet</strong> con monedas sin valor antes de usar mainnet.
@@ -52,6 +53,7 @@
         <legend data-i18n="unlockMode.legend">Como accedés</legend>
         <label><input type="radio" name="unlock-mode" id="mode-seed" checked> <span data-i18n="unlockMode.seed.label">Frase semilla (BIP39)</span></label>
         <label><input type="radio" name="unlock-mode" id="mode-key"> <span data-i18n="unlockMode.key.label">Clave privada (WIF)</span></label>
+        <label><input type="radio" name="unlock-mode" id="mode-watch"> <span data-i18n="unlockMode.watch.label">Solo consulta (xpub)</span></label>
       </fieldset>
 
       <p class="hint" data-i18n="fileLoad.hint">
@@ -121,6 +123,44 @@
       <p class="hint" data-i18n="wif.hint">Se revisan los 4 formatos de dirección posibles para esta clave (Legacy, P2SH-SegWit, Native SegWit y Taproot), igual que "Direcciones adicionales" en paper-wallet-btc.</p>
     </div>
 
+    <div id="watch-fields" class="advanced-only" hidden>
+      <p class="hint" data-i18n="watch.hint">
+        Solo consulta: nunca se pide una clave privada, así que esta wallet no puede
+        firmar ni transmitir nada. Sirve para ver el saldo y armar una transacción sin
+        firmar, para llevarla a firmar en otro lado (por ejemplo, PSBT Signer BTC).
+      </p>
+      <label class="field">
+        <span data-i18n="watch.addressType.label">Tipo de dirección de este xpub</span>
+        <select id="watch-address-type">
+          <option value="bech32" data-i18n="addressType.bech32" selected>Native SegWit (BIP84)</option>
+          <option value="legacy" data-i18n="addressType.legacy">Legacy (BIP44)</option>
+          <option value="p2sh" data-i18n="addressType.p2sh">SegWit compatible (BIP49)</option>
+          <option value="taproot" data-i18n="addressType.taproot">Taproot (BIP86)</option>
+        </select>
+      </label>
+      <label class="field">
+        <span data-i18n="watch.xpub.label">Clave pública extendida (xpub, ypub, zpub, tpub...)</span>
+        <textarea id="xpub-input" rows="3" autocomplete="off" spellcheck="false"></textarea>
+        <div class="file-load-row">
+          <button type="button" class="btn-secondary" id="xpub-file-btn" data-i18n="fileLoad.button">📁 Cargar desde archivo (USB)</button>
+          <input type="file" id="xpub-file-input" accept=".txt,text/plain" hidden>
+        </div>
+      </label>
+      <p class="hint" data-i18n="watch.origin.hint">
+        Los dos campos siguientes son opcionales para ver el saldo, pero
+        <strong>necesarios para que el PSBT que exportes se pueda firmar</strong> en otra
+        herramienta. Los muestra la misma wallet que te dio el xpub, al lado de él.
+      </p>
+      <label class="field">
+        <span data-i18n="watch.fingerprint.label">Fingerprint de la clave maestra (8 hex, opcional)</span>
+        <input type="text" id="watch-fingerprint" maxlength="8" autocomplete="off" spellcheck="false" placeholder="73c5da0a">
+      </label>
+      <label class="field">
+        <span data-i18n="watch.accountPath.label">Ruta de la cuenta (opcional)</span>
+        <input type="text" id="watch-account-path" autocomplete="off" spellcheck="false" placeholder="84'/0'/0'">
+      </label>
+    </div>
+
     <p id="unlock-error" class="error" hidden></p>
 
     <button type="submit" id="unlock-btn" class="btn-primary" data-i18n="unlock.button">Acceder a la wallet</button>
@@ -147,6 +187,12 @@
     Esta wallet viene de una clave privada importada, no de una frase semilla:
     no hay direcciones nuevas para rotar. Se recomienda enviar todo el saldo
     ("Enviar todo") a una wallet HD en vez de reutilizar esta dirección.
+  </div>
+
+  <div id="watch-notice" class="notice notice-warning" hidden data-i18n="dashboard.watchNotice">
+    Esta wallet es solo de consulta: no hay ninguna clave privada acá, así que
+    no puede firmar ni transmitir. "Enviar" arma la transacción y te da un
+    PSBT sin firmar para llevar a otra herramienta (por ejemplo, PSBT Signer BTC).
   </div>
 
   <div class="actions-row">
@@ -194,7 +240,7 @@
       <label>
         <input type="radio" name="fee-choice" value="custom" id="fee-custom">
         <span data-i18n="send.fee.custom">Personalizada:</span>
-        <input type="number" id="fee-custom-input" min="1" step="1" placeholder="sat/vB">
+        <input type="number" id="fee-custom-input" step="any" inputmode="decimal" placeholder="sat/vB">
       </label>
     </fieldset>
 
@@ -218,15 +264,20 @@
     <dt data-i18n="review.change">Cambio</dt><dd id="review-change"></dd>
   </dl>
 
+  <p id="review-fee-warning" class="notice notice-warning" hidden data-i18n="review.feeWarning"></p>
+  <p id="review-psbt-warning" class="notice notice-warning" hidden data-i18n="review.psbtNoOrigin"></p>
+
   <label class="checkbox-field">
     <input type="checkbox" id="review-confirm-checkbox">
-    <span data-i18n="review.confirm">Confirmo que los datos son correctos y quiero firmar y transmitir esta transacción.</span>
+    <span id="review-confirm-label" data-i18n="review.confirm">Confirmo que los datos son correctos y quiero firmar y transmitir esta transacción.</span>
   </label>
 
   <p id="review-error" class="error" hidden></p>
 
   <div class="actions-row">
     <button id="confirm-send-btn" class="btn-primary" disabled data-i18n="review.sign">Firmar y transmitir</button>
+    <button id="sign-only-btn" class="btn-secondary" disabled data-i18n="review.signOnly">Firmar sin transmitir</button>
+    <button id="build-psbt-btn" class="btn-primary" disabled hidden data-i18n="review.buildPsbt">Generar PSBT sin firmar</button>
     <button id="cancel-review-btn" class="btn-secondary" data-i18n="send.cancel">Cancelar</button>
   </div>
   </div>
@@ -234,15 +285,28 @@
 
 <section id="screen-result" class="screen" hidden>
   <div class="panel">
-  <h2 data-i18n="result.title">Transacción transmitida</h2>
-  <dl class="review-list">
+  <h2 id="result-title">Transacción transmitida</h2>
+  <p id="result-hint" class="hint">Ya se envió a la red — podés verla en el explorador.</p>
+
+  <dl class="review-list" id="result-txid-row">
     <dt data-i18n="result.txid">TXID</dt><dd id="result-txid" class="mono"></dd>
   </dl>
-  <p><a id="result-explorer-link" href="#" target="_blank" rel="noopener noreferrer"></a></p>
-  <details>
-    <summary data-i18n="result.showHex">Ver hex firmado</summary>
-    <p id="result-hex" class="mono wrap"></p>
-  </details>
+  <p id="result-explorer-row"><a id="result-explorer-link" href="#" target="_blank" rel="noopener noreferrer"></a></p>
+
+  <label class="field">
+    <span id="result-output-label">Transacción firmada (hex)</span>
+    <textarea id="result-hex" class="mono" rows="6" readonly></textarea>
+  </label>
+
+  <div class="qr-wrap">
+    <img id="result-qr" alt="">
+  </div>
+
+  <div class="actions-row">
+    <button id="result-copy-btn" type="button" class="btn-secondary" data-i18n="result.copy">Copiar</button>
+    <button id="result-download-btn" type="button" class="btn-secondary" data-i18n="result.download">⬇ Descargar .txt</button>
+  </div>
+
   <button id="back-to-dashboard-btn" class="btn-primary" data-i18n="result.back">Volver a la wallet</button>
   </div>
 </section>
